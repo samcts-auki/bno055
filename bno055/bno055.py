@@ -37,7 +37,7 @@ from bno055.params.NodeParameters import NodeParameters
 from bno055.sensor.SensorService import SensorService
 import rclpy
 from rclpy.node import Node
-
+import time
 
 class Bno055Node(Node):
     """
@@ -97,6 +97,7 @@ def main(args=None):
         lock = threading.Lock()
 
         def read_data():
+
             """Periodic data_query_timer executions to retrieve sensor IMU data."""
             if lock.locked():
                 # critical area still locked
@@ -108,12 +109,16 @@ def main(args=None):
             lock.acquire()
             try:
                 # perform synchronized block:
+                start_time = time.time()
                 node.sensor.get_sensor_data()
+                # print(f"get_sensor_data() time cost: {time.time()-start_time} seconds")
             except BusOverRunException:
                 # data not available yet, wait for next cycle | see #5
+                node.get_logger().warn('BusOverRunException')
                 return
             except ZeroDivisionError:
                 # division by zero in get_sensor_data, return
+                node.get_logger().warn('ZeroDivisionError')
                 return
             except Exception as e:  # noqa: B902
                 node.get_logger().warn('Receiving sensor data failed with %s:"%s"'
@@ -142,15 +147,17 @@ def main(args=None):
             finally:
                 lock.release()
 
+        group1 = rclpy.callback_groups.MutuallyExclusiveCallbackGroup()
+
         # start regular sensor transmissions:
         # please be aware that frequencies around 30Hz and above might cause performance impacts:
         # https://github.com/ros2/rclpy/issues/520
         f = 1.0 / float(node.param.data_query_frequency.value)
-        data_query_timer = node.create_timer(f, read_data)
+        data_query_timer = node.create_timer(f, read_data, group1)
 
         # start regular calibration status logging
-        f = 1.0 / float(node.param.calib_status_frequency.value)
-        status_timer = node.create_timer(f, log_calibration_status)
+        # f = 1.0 / float(node.param.calib_status_frequency.value)
+        # status_timer = node.create_timer(f, log_calibration_status)
 
         rclpy.spin(node)
 
@@ -161,7 +168,7 @@ def main(args=None):
         node.get_logger().info('ROS node shutdown')
         try:
             node.destroy_timer(data_query_timer)
-            node.destroy_timer(status_timer)
+            # node.destroy_timer(status_timer)
         except UnboundLocalError:
             node.get_logger().info('No timers to shutdown')
         node.destroy_node()

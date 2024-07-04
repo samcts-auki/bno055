@@ -42,6 +42,8 @@ from sensor_msgs.msg import Imu, MagneticField, Temperature
 from std_msgs.msg import String
 from example_interfaces.srv import Trigger
 
+import builtin_interfaces.msg
+from bitstring import BitArray
 
 class SensorService:
     """Provide an interface for accessing the sensor's features & data."""
@@ -50,7 +52,8 @@ class SensorService:
         self.node = node
         self.con = connector
         self.param = param
-
+        self.counter = 0
+        self.last_timestamp = 0
         prefix = self.param.ros_topic_prefix.value
         QoSProf = QoSProfile(depth=10)
 
@@ -84,13 +87,16 @@ class SensorService:
         if not (self.con.transmit(registers.BNO055_PWR_MODE_ADDR, 1, bytes([registers.POWER_MODE_NORMAL]))):
             self.node.get_logger().warn('Unable to set IMU normal power mode.')
 
+        # self.enable_intrupte()
+
         if not (self.con.transmit(registers.BNO055_PAGE_ID_ADDR, 1, bytes([0x00]))):
             self.node.get_logger().warn('Unable to set IMU register page 0.')
 
         if not (self.con.transmit(registers.BNO055_SYS_TRIGGER_ADDR, 1, bytes([0x00]))):
             self.node.get_logger().warn('Unable to start IMU.')
 
-        if not (self.con.transmit(registers.BNO055_UNIT_SEL_ADDR, 1, bytes([0x83]))):
+        # if not (self.con.transmit(registers.BNO055_UNIT_SEL_ADDR, 1, bytes([0x83]))):
+        if not (self.con.transmit(registers.BNO055_UNIT_SEL_ADDR, 1, bytes([0x06]))): # m/s^2 and rps
             self.node.get_logger().warn('Unable to set IMU units.')
 
         # The sensor placement configuration (Axis remapping) defines the
@@ -104,7 +110,8 @@ class SensorService:
             'P4': bytes(b'\x24\x03'),
             'P5': bytes(b'\x21\x02'),
             'P6': bytes(b'\x21\x07'),
-            'P7': bytes(b'\x24\x05')
+            'P7': bytes(b'\x24\x05'),
+            'THC': bytes(b'\x24\x04')
         }
         if not (self.con.transmit(registers.BNO055_AXIS_MAP_CONFIG_ADDR, 2,
                                   mount_positions[self.param.placement_axis_remap.value])):
@@ -137,6 +144,26 @@ class SensorService:
 
         self.node.get_logger().info('Bosch BNO055 IMU configuration complete.')
 
+    def enable_intrupte(self):
+        if not (self.con.transmit(registers.BNO055_PAGE_ID_ADDR, 1, bytes([0x01]))):
+            self.node.get_logger().warn('Unable to set IMU register page 1.')
+
+        if not (self.con.transmit(registers.BNO055_INT_EN, 1, bytes([0x11]))):
+            self.node.get_logger().warn('Unable to enable interupt.')
+
+        self.node.get_logger().info(f'INT_EN return: {self.con.receive(registers.BNO055_INT_EN, 1)}')
+
+        if not (self.con.transmit(registers.BNO055_PAGE_ID_ADDR, 1, bytes([0x00]))):
+            self.node.get_logger().warn('Unable to set IMU register page 0.')
+        return
+
+    def check_data_ready(self):
+        buf = self.con.receive(registers.BNO055_INTR_STAT_ADDR, 1)
+        print(f"intr_stat return: {bytes(buf)}")
+        # bits = self.unpackByteToBit(buf)
+        # print(bits)
+        return
+
     def get_sensor_data(self):
         """Read IMU data from the sensor, parse and publish."""
         # Initialize ROS msgs
@@ -146,13 +173,19 @@ class SensorService:
         grav_msg = Vector3()
         temp_msg = Temperature()
 
+        # Attempt to check Data Ready Trigger
+        # self.check_data_ready()
+
         # read from sensor
-        buf = self.con.receive(registers.BNO055_ACCEL_DATA_X_LSB_ADDR, 45)
+        # Read buffer at same time should be synced
+        buf = self.con.receive(registers.BNO055_ACCEL_DATA_X_LSB_ADDR, 18)
+        
         # Publish raw data
-        imu_raw_msg.header.stamp = self.node.get_clock().now().to_msg()
+        node_time = self.node.get_clock().now()
+        imu_raw_msg.header.stamp = node_time.to_msg()
         imu_raw_msg.header.frame_id = self.param.frame_id.value
         # TODO: do headers need sequence counters now?
-        # imu_raw_msg.header.seq = seq
+        # imu_raw_msg.header.seq = self.counter
 
         # TODO: make this an option to publish?
         imu_raw_msg.orientation_covariance = [
@@ -186,74 +219,94 @@ class SensorService:
         # node.get_logger().info('Publishing imu message')
         self.pub_imu_raw.publish(imu_raw_msg)
 
+        ts = float(node_time.nanoseconds) / 1e9
+
+        
+        # print last timestamp
+        dt = ts - self.last_timestamp
+        if (abs(dt) > 0.012):
+            print(f"dt larger than expected: {dt}")
+        self.last_timestamp = ts
+        self.counter += 1
+
+        # with open('imu_timestamp.csv', 'a') as f:
+        #     f.write(f"{ts}\n")
+
+        # with open('imu_timestamp_sys_time.csv', 'a') as f:
+        #     f.write(f"{systime_now}\n")
+
+        # print(imu_raw_msg.header.stamp)
+        # print(systime_now)
+
         # TODO: make this an option to publish?
-        # Publish filtered data
-        imu_msg.header.stamp = self.node.get_clock().now().to_msg()
-        imu_msg.header.frame_id = self.param.frame_id.value
+        # # Publish filtered data
+        # imu_msg.header.stamp = imu_raw_msg.header.stamp
+        # imu_msg.header.frame_id = self.param.frame_id.value
 
-        q = Quaternion()
-        # imu_msg.header.seq = seq
-        q.w = self.unpackBytesToFloat(buf[24], buf[25])
-        q.x = self.unpackBytesToFloat(buf[26], buf[27])
-        q.y = self.unpackBytesToFloat(buf[28], buf[29])
-        q.z = self.unpackBytesToFloat(buf[30], buf[31])
-        # TODO(flynneva): replace with standard normalize() function
-        # normalize
-        norm = sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
-        imu_msg.orientation.x = q.x / norm
-        imu_msg.orientation.y = q.y / norm
-        imu_msg.orientation.z = q.z / norm
-        imu_msg.orientation.w = q.w / norm
+        # q = Quaternion()
+        # # imu_msg.header.seq = seq
+        # q.w = self.unpackBytesToFloat(buf[24], buf[25])
+        # q.x = self.unpackBytesToFloat(buf[26], buf[27])
+        # q.y = self.unpackBytesToFloat(buf[28], buf[29])
+        # q.z = self.unpackBytesToFloat(buf[30], buf[31])
+        # # TODO(flynneva): replace with standard normalize() function
+        # # normalize
+        # norm = sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+        # imu_msg.orientation.x = q.x / norm
+        # imu_msg.orientation.y = q.y / norm
+        # imu_msg.orientation.z = q.z / norm
+        # imu_msg.orientation.w = q.w / norm
 
-        imu_msg.orientation_covariance = imu_raw_msg.orientation_covariance
+        # imu_msg.orientation_covariance = imu_raw_msg.orientation_covariance
 
-        imu_msg.linear_acceleration.x = \
-            self.unpackBytesToFloat(buf[32], buf[33]) / self.param.acc_factor.value
-        imu_msg.linear_acceleration.y = \
-            self.unpackBytesToFloat(buf[34], buf[35]) / self.param.acc_factor.value
-        imu_msg.linear_acceleration.z = \
-            self.unpackBytesToFloat(buf[36], buf[37]) / self.param.acc_factor.value
-        imu_msg.linear_acceleration_covariance = imu_raw_msg.linear_acceleration_covariance
-        imu_msg.angular_velocity.x = \
-            self.unpackBytesToFloat(buf[12], buf[13]) / self.param.gyr_factor.value
-        imu_msg.angular_velocity.y = \
-            self.unpackBytesToFloat(buf[14], buf[15]) / self.param.gyr_factor.value
-        imu_msg.angular_velocity.z = \
-            self.unpackBytesToFloat(buf[16], buf[17]) / self.param.gyr_factor.value
-        imu_msg.angular_velocity_covariance = imu_raw_msg.angular_velocity_covariance
-        self.pub_imu.publish(imu_msg)
+        # imu_msg.linear_acceleration.x = \
+        #     self.unpackBytesToFloat(buf[32], buf[33]) / self.param.acc_factor.value
+        # imu_msg.linear_acceleration.y = \
+        #     self.unpackBytesToFloat(buf[34], buf[35]) / self.param.acc_factor.value
+        # imu_msg.linear_acceleration.z = \
+        #     self.unpackBytesToFloat(buf[36], buf[37]) / self.param.acc_factor.value
+        # imu_msg.linear_acceleration_covariance = imu_raw_msg.linear_acceleration_covariance
+        # imu_msg.angular_velocity.x = \
+        #     self.unpackBytesToFloat(buf[12], buf[13]) / self.param.gyr_factor.value
+        # imu_msg.angular_velocity.y = \
+        #     self.unpackBytesToFloat(buf[14], buf[15]) / self.param.gyr_factor.value
+        # imu_msg.angular_velocity.z = \
+        #     self.unpackBytesToFloat(buf[16], buf[17]) / self.param.gyr_factor.value
+        # imu_msg.angular_velocity_covariance = imu_raw_msg.angular_velocity_covariance
+        # self.pub_imu.publish(imu_msg)
 
-        # Publish magnetometer data
-        mag_msg.header.stamp = self.node.get_clock().now().to_msg()
-        mag_msg.header.frame_id = self.param.frame_id.value
-        # mag_msg.header.seq = seq
-        mag_msg.magnetic_field.x = \
-            self.unpackBytesToFloat(buf[6], buf[7]) / self.param.mag_factor.value
-        mag_msg.magnetic_field.y = \
-            self.unpackBytesToFloat(buf[8], buf[9]) / self.param.mag_factor.value
-        mag_msg.magnetic_field.z = \
-            self.unpackBytesToFloat(buf[10], buf[11]) / self.param.mag_factor.value
-        mag_msg.magnetic_field_covariance = [
-            self.param.variance_mag.value[0], 0.0, 0.0,
-            0.0, self.param.variance_mag.value[1], 0.0,
-            0.0, 0.0, self.param.variance_mag.value[2]
-        ]
-        self.pub_mag.publish(mag_msg)
+        # # Publish magnetometer data
+        # mag_msg.header.stamp = imu_raw_msg.header.stamp
+        # mag_msg.header.frame_id = self.param.frame_id.value
+        # # mag_msg.header.seq = seq
+        # mag_msg.magnetic_field.x = \
+        #     self.unpackBytesToFloat(buf[6], buf[7]) / self.param.mag_factor.value
+        # mag_msg.magnetic_field.y = \
+        #     self.unpackBytesToFloat(buf[8], buf[9]) / self.param.mag_factor.value
+        # mag_msg.magnetic_field.z = \
+        #     self.unpackBytesToFloat(buf[10], buf[11]) / self.param.mag_factor.value
+        # mag_msg.magnetic_field_covariance = [
+        #     self.param.variance_mag.value[0], 0.0, 0.0,
+        #     0.0, self.param.variance_mag.value[1], 0.0,
+        #     0.0, 0.0, self.param.variance_mag.value[2]
+        # ]
+        # self.pub_mag.publish(mag_msg)
 
-        grav_msg.x = \
-            self.unpackBytesToFloat(buf[38], buf[39]) / self.param.grav_factor.value
-        grav_msg.y = \
-            self.unpackBytesToFloat(buf[40], buf[41]) / self.param.grav_factor.value
-        grav_msg.z = \
-            self.unpackBytesToFloat(buf[42], buf[43]) / self.param.grav_factor.value
-        self.pub_grav.publish(grav_msg)
+        # grav_msg.x = \
+        #     self.unpackBytesToFloat(buf[38], buf[39]) / self.param.grav_factor.value
+        # grav_msg.y = \
+        #     self.unpackBytesToFloat(buf[40], buf[41]) / self.param.grav_factor.value
+        # grav_msg.z = \
+        #     self.unpackBytesToFloat(buf[42], buf[43]) / self.param.grav_factor.value
+        # self.pub_grav.publish(grav_msg)
 
-        # Publish temperature
-        temp_msg.header.stamp = self.node.get_clock().now().to_msg()
-        temp_msg.header.frame_id = self.param.frame_id.value
-        # temp_msg.header.seq = seq
-        temp_msg.temperature = float(buf[44])
-        self.pub_temp.publish(temp_msg)
+        # # Publish temperature
+        # temp_msg.header.stamp = imu_raw_msg.header.stamp
+        # temp_msg.header.frame_id = self.param.frame_id.value
+        # # temp_msg.header.seq = seq
+        # temp_msg.temperature = float(buf[44])
+        # self.pub_temp.publish(temp_msg)
+        return
 
     def get_calib_status(self):
         """
@@ -400,7 +453,8 @@ class SensorService:
             self.node.get_logger().warn('Unable to set IMU into config mode.')
         sleep(0.025)
         calib_data = self.get_calib_data()
-        if not (self.con.transmit(registers.BNO055_OPR_MODE_ADDR, 1, bytes([registers.OPERATION_MODE_NDOF]))):
+        # switch back to imu operation mode declared in parameters
+        if not (self.con.transmit(registers.BNO055_OPR_MODE_ADDR, 1, bytes([self.param.operation_mode.value]))):
             self.node.get_logger().warn('Unable to set IMU operation mode into operation mode.')
         response.success = True
         response.message = str(calib_data)
@@ -408,3 +462,6 @@ class SensorService:
 
     def unpackBytesToFloat(self, start, end):
         return float(struct.unpack('h', struct.pack('BB', start, end))[0])
+    
+    def unpackByteToBit(self, byte):
+        return BitArray(hex=byte).bin[2:]

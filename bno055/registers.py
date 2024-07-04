@@ -229,6 +229,9 @@ OPERATION_MODE_M4G                   = 0X0A
 OPERATION_MODE_NDOF_FMC_OFF          = 0X0B
 OPERATION_MODE_NDOF                  = 0X0C
 
+#: PAGE1 REGISTER DEFINITION START
+BNO055_INT_EN                        = 0x10
+
 #: Communication constants
 COM_START_BYTE_WR = 0xAA
 COM_START_BYTE_RESP = 0xBB
